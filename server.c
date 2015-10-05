@@ -1,9 +1,9 @@
 /*
- * =====================================================================================
+ * ============================================================================
  *
  *       Filename:  server.c
  *
- *    Description:
+ *    Description:  A simple IRC chat program
  *
  *        Version:  1.0
  *        Created:  09/19/2015 14:53:11
@@ -13,11 +13,8 @@
  *         Author:  Theodore Ahlfeld (), twahlfeld@gmail.com
  *   Organization:
  *
- * =====================================================================================
+ * ============================================================================
  */
-
-#define DEBUG
-
 
 #include <signal.h>
 #include <stdio.h>
@@ -29,6 +26,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/errno.h>
 #include "list.h"
 #include "server.h"
 #include "auth.h"
@@ -51,12 +49,22 @@ char motd[128];
 int serv_sock, timeout = TIME_OUT;
 List usr_lst, ban_lst;
 
+/*
+ * Error checking for critical procedures
+ * const char *err_msg  -> Function that caused the failure
+ */
 void die_with_err(const char *err_msg)
 {
     perror(err_msg);
     exit(1);
 }
 
+/*
+ * Compares users name between a string and a User_Sock struct
+ * const void *a    -> string of the user name to find
+ * const void *b    -> The User_Sock struct to test for
+ * returns the difference between the string and the User name.
+ */
 int cmpusr(const void *a, const void *b)
 {
     char *name = ((User_Sock *) b)->name;
@@ -66,11 +74,17 @@ int cmpusr(const void *a, const void *b)
     return -1;
 }
 
+/*
+ * Creates the User_Sock struct, and adds it to fds socket list
+ * int sock -> The file descriptor for the socket of the new client
+ * sockaddr_in *addr    -> The sockaddr_in for the client
+ * returns the User_Sock created
+ */
 User_Sock *create_usr_sock(int sock, struct sockaddr_in *addr)
 {
     User_Sock *usr_sock = (User_Sock *) malloc(sizeof(User_Sock));
     usr_sock->sock = sock;
-    usr_sock->ip = (char *) malloc(strlen("XXX.XXX.XXX.XXX0"));
+    usr_sock->ip = (char *) malloc(strlen("XXX.XXX.XXX.XXX0")); // max IP size
     strcpy(usr_sock->ip, inet_ntoa(addr->sin_addr));
     FD_SET(sock, &mstr_fds);
     usr_sock->name = NULL;
@@ -78,6 +92,11 @@ User_Sock *create_usr_sock(int sock, struct sockaddr_in *addr)
     return usr_sock;
 }
 
+/*
+ * Disconnects a user and cleans up all resources
+ * void *us -> The User_Socket to remove
+ * int flag -> The flag for reason of leaving default is quit
+ */
 void kill_user(void *us, int flag)
 {
     User_Sock *usr_sock = (User_Sock *) us;
@@ -93,6 +112,7 @@ void kill_user(void *us, int flag)
         strcpy(reason, "quit");
     }
     printf("%s(socket %d) has disconnected(%s)\n", usr_sock->ip, usr_sock->sock, reason);
+    // frees the credential so this username can log in again
     if (cred) {
         sprintf(buf, "%s has disconnected(%s)\n", cred->user, reason);
         broadcast(&usr_lst, buf, sock);
@@ -107,11 +127,19 @@ void kill_user(void *us, int flag)
     usr_sock = NULL;
 }
 
+/*
+ * Default kill user with quit flag
+ * void *us -> The user to remove
+ */
 void dft_kill(void *us)
 {
     kill_user(us, 0);
 }
 
+/*
+ * The graceful exit from a signal interrupt
+ * int sigint   -> the signal interrupt code
+ */
 static void die_gracefully(int sigint)
 {
     traverse_list(&usr_lst, dft_kill);
@@ -123,12 +151,24 @@ static void die_gracefully(int sigint)
     exit(0);
 }
 
+/*
+ * Compares user credentials for quick sort to allow binary search
+ * const void *a    -> Credential
+ * const void *b    -> Credential
+ * returns the difference from the username in a to username in b
+ */
 int cmp(const void *a, const void *b)
 {
     return strcasecmp(((Credential *) a)->user, ((Credential *) b)->user);
 }
 
-struct sockaddr_in init_socket_addr(const long long addr, unsigned short port)
+/*
+ * Initializes the Socket Address
+ * const unsigned long addr -> s_addr's destination
+ * unsigned short port      -> The port for the socket
+ * returns the sockaddr_in initialized properly
+ */
+struct sockaddr_in init_socket_addr(const unsigned long addr, unsigned short port)
 {
     struct sockaddr_in sock_addr;
     memset(&sock_addr, 0, sizeof(sock_addr));
@@ -138,15 +178,26 @@ struct sockaddr_in init_socket_addr(const long long addr, unsigned short port)
     return sock_addr;
 }
 
-void close_sock(const char *srv_msg, const char *broad_msg, User_Sock *us)
+/*
+ * Disconnects the user by default with server and broadcast msg
+ * const char *srv_msg  -> The server log messages
+ * const char *broad_msg-> The message to broadcast to all users
+ * User_Sock *us        -> The user to remove
+ */
+void dft_kill_with_msg(const char *srv_msg, const char *broad_msg, User_Sock *us)
 {
     if (srv_msg) {
         printf("%s", srv_msg);
     }
     broadcast(&usr_lst, broad_msg, us->sock);
-    kill_user(us, 0);
+    dft_kill(us);
 }
 
+/*
+ * Changes the motd or welcome message
+ * char *msg    -> The new motd
+ * char *usr    -> The name of the user that changed it
+ */
 void set_motd(char *msg, char *usr)
 {
     if (usr) {
@@ -155,6 +206,10 @@ void set_motd(char *msg, char *usr)
     strncpy(motd, msg, sizeof(motd));
 }
 
+/*
+ * Prints the motd to a specified user
+ * int sock -> The socket to print the motd to
+ */
 void print_motd(int sock)
 {
     char buf[MAXBUF];
@@ -163,9 +218,15 @@ void print_motd(int sock)
     send(sock, buf, len, 0);
 }
 
+/*
+ * The authentication for the new user to enter username and password.
+ * Handle both credential processing and banning after MAX_PASS_ATTEMPTS fails
+ * User_Sock *usr_sock  -> The User_Sock that the server need to authenticate
+ * returns NULL always, pthread clean up
+ */
 void *connect_client(User_Sock *usr_sock)
 {
-    int sock = usr_sock->sock;
+    int sock = usr_sock->sock, i;
     usr_sock->name = NULL;;
     Credential *cred;
     char buf[MAXBUF];
@@ -173,8 +234,8 @@ void *connect_client(User_Sock *usr_sock)
     char *srv_msg = NULL, *brd_msg = NULL;
     len = sprintf(buf, "Username: ");
     buf[sizeof(buf)-1] = '\0';
-    send(sock, buf, len, 0);
-    if ((len = recv(sock, buf, sizeof(buf), 0)) <= 0) {
+    send(sock, buf, (size_t)len, 0);
+    if ((len = recv(sock, buf, sizeof(buf), 0)) <= 0 && errno != EAGAIN) {
         if (len < 0) {
             perror("recv() failed");
             goto end;
@@ -182,31 +243,34 @@ void *connect_client(User_Sock *usr_sock)
     }
     buf[--len] = '\0';
 
+    /* Wrong Username, Disconnect */
     if ((cred = find_cred(buf, cred_list, cred_nel)) == 0) {
-        strcpy(buf, "Username was not found\n");
-        send(sock, buf, strlen(buf), 0);
+        len = sprintf(buf, "Username was not found\n");
+        send(sock, buf, (size_t)len, 0);
         goto end;
     }
     usr_sock->name = cred->user;
+    /* Username already logged in, Disconnect */
     if (cred->in_use) {
         len = sprintf(buf, "User %s is already logged in\n", usr_sock->name);
-        send(sock, buf, len, 0);
+        send(sock, buf, (size_t)len, 0);
         goto end;
-    } else if (time(NULL) - cred->suspend <= BLOCK_TIME) {
-
     }
-    int i;
+
+    /* Password Checking Routine*/
     for (i = 0; i < MAX_PASS_ATTEMPTS; i++) {
         strcpy(buf, "Password: ");
         send(sock, buf, strlen(buf), 0);
-        if ((len = recv(sock, buf, strlen(buf), 0)) <= 0) {
+        if ((len = recv(sock, buf, strlen(buf), 0)) <= 0 && errno != EAGAIN) {
             if (len <= 0) {
                 perror("recv() failed");
                 goto end;
             }
         }
         buf[--len] = '\0';
-        if (strncmp(buf, cred->pass, (size_t) len) == 0) {
+
+        /* Password Check */
+        if (strncmp(buf, cred->pass, (size_t) len) == 0) {  // Password Accepted
             cred->in_use = 1;
             sprintf(buf, "User %s has connected\n", usr_sock->name);
             printf("%s logged in as %s\n", usr_sock->ip, usr_sock->name);
@@ -214,24 +278,30 @@ void *connect_client(User_Sock *usr_sock)
             print_motd(sock);
             add_front(&usr_lst, usr_sock);
             return NULL;
-        } else {
+        } else {    // Password invalid
             len = sprintf(buf, "Wrong Password\n");
-            if ((send(sock, buf, len, 0)) < 0) {
+            if ((send(sock, buf, (size_t)len, 0)) < 0) {
                 perror("send() failed");
                 goto end;
             }
         }
     }
+    /* Password Attempt exceeded, Ban IP */
     len = sprintf(buf, "Maximum Password Attempts have been exceeded\n");
-    send(sock, buf, len, 0);
+    send(sock, buf, (size_t)len, 0);
     ban_usr(&ban_lst, usr_sock->ip, buf, BLOCK_TIME);
     srv_msg = buf;
 
     end:
-    close_sock(srv_msg, brd_msg, usr_sock);
+    dft_kill_with_msg(srv_msg, brd_msg, usr_sock);
     return NULL;
 }
 
+/*
+ * Finds a current user
+ * const char *usr  -> Username to find
+ * returns the User_Sock if found otherwise NULL
+ */
 User_Sock *find_usr(const char *usr)
 {
     if (usr) {
@@ -243,6 +313,12 @@ User_Sock *find_usr(const char *usr)
     return NULL;
 }
 
+/*
+ * Accepts Connection of connection client checks if IP is banned
+ * Also spawns a thread to handle authentication of user
+ * struct sockaddr_in *clnt_addr    -> The sockaddr_in of the client to connect
+ * int fdmax    -> The current maximum file descriptor
+ */
 int accept_connection(struct sockaddr_in *clnt_addr, int fdmax)
 {
     pthread_t thread;
@@ -255,6 +331,7 @@ int accept_connection(struct sockaddr_in *clnt_addr, int fdmax)
         perror("accept() failed");
     } else {
         Banned_User *usr = NULL;
+        /* Checks Ban */
         if ((usr = check_ban(&ban_lst, inet_ntoa(clnt_addr->sin_addr)))) {
             len = sprintf(buf, "Banned for %s for %ld minutes\nreason: %s\n",
                          usr->ip, (usr->ban_expire - time(NULL))/60, usr->rsn);
@@ -262,7 +339,7 @@ int accept_connection(struct sockaddr_in *clnt_addr, int fdmax)
             shutdown(sock, SHUT_RDWR);
             close(sock);
             FD_CLR(sock, &mstr_fds);
-        } else {
+        } else {    // not banned
             fdmax = (fdmax > sock ? fdmax : sock);
             usr_sock = create_usr_sock(sock, clnt_addr);
             printf("%s attempting to connect\n", usr_sock->ip);
@@ -283,7 +360,7 @@ int main(int argc, char *argv[])
      */
     char *file_loc = AUTH_FILE_LOCATION;
     cred_nel = (size_t) count_lines(file_loc);
-    cred_list = load_credentials(file_loc, cred_list, cred_nel);
+    cred_list = load_credentials(file_loc, cred_list, &cred_nel);
     qsort(cred_list, cred_nel, sizeof(Credential), cmp);
 
     char buf[MAXBUF];
@@ -294,7 +371,6 @@ int main(int argc, char *argv[])
     struct sockaddr_in serv_addr; /* Local address */
     struct sockaddr_in clnt_addr; /* Client address */
     unsigned short port = (unsigned short) atoi(argv[1]);
-    serv_addr = init_socket_addr(INADDR_ANY, port);
     int enabled = 1, fdmax;
     struct timeval block_timev;
     ssize_t len;
@@ -303,6 +379,7 @@ int main(int argc, char *argv[])
     /*
      * Setting up server connection
      */
+    serv_addr = init_socket_addr(INADDR_ANY, port);
     if ((serv_sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP)) < 0) {
         die_with_err("socket() failed");
     }
@@ -323,7 +400,7 @@ int main(int argc, char *argv[])
     init_list(&ban_lst);
     add_front(&usr_lst, usr_sock);
     fdmax = serv_sock;
-    for (; ;) { // Run til signal interrupt
+    for (;;) { // Run til signal interrupt
         rdonly_fds = mstr_fds;
         signal(SIGINT, die_gracefully);
         signal(SIGTERM, die_gracefully);
@@ -331,10 +408,8 @@ int main(int argc, char *argv[])
         block_timev.tv_usec = 0;
         if (select(fdmax + 1, &rdonly_fds, NULL, NULL,
                    (timeout ? &block_timev : NULL)) < 0) {
-            //die_with_err("select() failed");
-            perror("select() failed");
+            die_with_err("select() failed");
         }
-
         Node *usr_node = usr_lst.head;
 
         while (usr_node) {

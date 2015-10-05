@@ -8,6 +8,10 @@ CXXFLAGS = -g -Wall $(INCLUDES)
 LDFLAGS = -g
 LDLIBS  = -lpthread
 
+.PHONY: default
+default: server client
+	rm -rf *~ a.out *.o *dSYM
+
 server: server.o auth.o list.o srv_io.o
 
 client: client.o
@@ -21,9 +25,6 @@ auth.o: auth.c auth.h
 list.o: list.c list.h
 
 srv_io.o: srv_io.c srv_io.h
-
-.PHONY: default
-	server client
 
 .PHONY: clean
 clean:
